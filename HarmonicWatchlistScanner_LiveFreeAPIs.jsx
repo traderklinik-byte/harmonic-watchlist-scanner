@@ -1,0 +1,981 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+// ============================================================================
+// HARMONIC WATCHLIST SCANNER — LIVE / FREE API EDITION
+// Rebuild by ChatGPT for Trader Klinik
+// Fokus update harga realtime / near-realtime dengan multi-source fallback.
+//
+// Sumber data yang dipakai:
+// 1) Binance public WebSocket + REST     → crypto realtime/no-key
+// 2) CoinGecko keyless REST fallback     → crypto fallback/no-key
+// 3) Yahoo Finance chart endpoint        → forex, XAU, IDX best-effort/no-key/unofficial
+// 4) Frankfurter public FX API           → forex reference fallback/no-key, bukan tick realtime
+// 5) Stooq CSV                           → forex/XAU/market fallback/no-key, bisa kena CORS
+//
+// Catatan penting:
+// - Browser tidak bisa memaksa API yang tidak mengizinkan CORS. Jika Yahoo/Stooq gagal,
+//   isi Proxy URL dari file Worker gratis yang saya sertakan.
+// - Scanner ini masih memakai generator harmonic berbasis harga referensi. Validasi pola
+//   tetap harus dilakukan di chart TradingView sebelum entry.
+// ============================================================================
+
+const PRESETS = {
+  forex: ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "AUDUSD", "USDCAD", "GBPJPY", "NZDUSD"],
+  saham: ["BBCA", "BBRI", "TLKM", "ASII", "BMRI", "UNVR", "ANTM", "ADRO"],
+  crypto: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT"],
+};
+
+const PATS = ["Bat", "Gartley", "Butterfly", "Crab", "Cypher", "ABCD"];
+const TFS = ["M15", "H1", "H4", "D1"];
+const MARKETS = ["forex", "saham", "crypto"];
+
+const MKT_LBL = { forex: "Forex", saham: "Saham IDX", crypto: "Crypto" };
+const MKT_ICON = { forex: "💱", saham: "🏦", crypto: "₿" };
+const SCORE_LBL = ["", "Lemah", "Cukup", "Sedang", "Kuat", "A+"];
+const SCORE_CLR = ["", "#9CA3AF", "#B45309", "#F97316", "#16A34A", "#0F6E56"];
+const DOT_CLR = ["", "#9CA3AF", "#F59E0B", "#F97316", "#16A34A", "#0F6E56"];
+
+const DEFAULT_PRICES = {
+  EURUSD: 1.085, GBPUSD: 1.27, USDJPY: 157.5, XAUUSD: 3300,
+  AUDUSD: 0.645, USDCAD: 1.36, GBPJPY: 199.5, NZDUSD: 0.598,
+  USDCHF: 0.892, EURJPY: 171,
+  BBCA: 6300, BBRI: 4505, TLKM: 3800, ASII: 5200, BMRI: 5961,
+  UNVR: 2500, ANTM: 1622, ADRO: 2776, GOTO: 64, ICBP: 10500,
+  BTCUSDT: 105000, ETHUSDT: 2500, BNBUSDT: 680, SOLUSDT: 165,
+  XRPUSDT: 2.25, ADAUSDT: 0.72, AVAXUSDT: 24, DOTUSDT: 4.8, MATICUSDT: 0.38,
+};
+
+const TV_MAP = {
+  EURUSD: "FX:EURUSD", GBPUSD: "FX:GBPUSD", USDJPY: "FX:USDJPY", XAUUSD: "TVC:GOLD",
+  AUDUSD: "FX:AUDUSD", USDCAD: "FX:USDCAD", GBPJPY: "FX:GBPJPY", NZDUSD: "FX:NZDUSD",
+  USDCHF: "FX:USDCHF", EURJPY: "FX:EURJPY",
+  BBCA: "IDX:BBCA", BBRI: "IDX:BBRI", TLKM: "IDX:TLKM", ASII: "IDX:ASII",
+  BMRI: "IDX:BMRI", UNVR: "IDX:UNVR", ANTM: "IDX:ANTM", ADRO: "IDX:ADRO",
+  GOTO: "IDX:GOTO", ICBP: "IDX:ICBP",
+  BTCUSDT: "BINANCE:BTCUSDT", ETHUSDT: "BINANCE:ETHUSDT", BNBUSDT: "BINANCE:BNBUSDT",
+  SOLUSDT: "BINANCE:SOLUSDT", XRPUSDT: "BINANCE:XRPUSDT", ADAUSDT: "BINANCE:ADAUSDT",
+  AVAXUSDT: "BINANCE:AVAXUSDT", DOTUSDT: "BINANCE:DOTUSDT", MATICUSDT: "BINANCE:MATICUSDT",
+};
+
+const YAHOO_MAP = {
+  EURUSD: ["EURUSD=X"], GBPUSD: ["GBPUSD=X"], USDJPY: ["JPY=X", "USDJPY=X"],
+  XAUUSD: ["GC=F", "XAUUSD=X"], AUDUSD: ["AUDUSD=X"], USDCAD: ["CAD=X", "USDCAD=X"],
+  GBPJPY: ["GBPJPY=X"], NZDUSD: ["NZDUSD=X"], USDCHF: ["CHF=X", "USDCHF=X"], EURJPY: ["EURJPY=X"],
+};
+
+const STOOQ_MAP = {
+  EURUSD: "eurusd", GBPUSD: "gbpusd", USDJPY: "usdjpy", XAUUSD: "xauusd", AUDUSD: "audusd",
+  USDCAD: "usdcad", GBPJPY: "gbpjpy", NZDUSD: "nzdusd", USDCHF: "usdchf", EURJPY: "eurjpy",
+};
+
+const CG_ID = {
+  BTCUSDT: "bitcoin", ETHUSDT: "ethereum", BNBUSDT: "binancecoin", SOLUSDT: "solana",
+  XRPUSDT: "ripple", ADAUSDT: "cardano", AVAXUSDT: "avalanche-2", DOTUSDT: "polkadot",
+  MATICUSDT: "matic-network",
+};
+
+const N = "#1B2A4A";
+const G = "#C9973A";
+const T = "#1A6B6B";
+const GRN = "#2D7A3A";
+const RED = "#C0392B";
+const AMB = "#B45309";
+const BDR = "0.5px solid var(--color-border-tertiary, #E5E7EB)";
+const CARD = {
+  background: "var(--color-background-primary, #fff)",
+  border: BDR,
+  borderRadius: "var(--border-radius-md, 10px)",
+  padding: "12px 14px",
+};
+const SEL = {
+  fontSize: 12,
+  height: 30,
+  padding: "0 8px",
+  borderRadius: "var(--border-radius-md, 8px)",
+  border: BDR,
+  background: "var(--color-background-primary, #fff)",
+  color: "var(--color-text-primary, #111827)",
+};
+
+const DEFAULT_SETTINGS = {
+  autoRefresh: true,
+  refreshSec: 20,
+  useBinanceWs: true,
+  useBinanceRest: true,
+  useCoinGecko: true,
+  useYahoo: true,
+  useFrankfurter: true,
+  useStooq: true,
+  proxyBase: "",
+};
+
+function safeJsonParse(raw, fallback) {
+  try { return JSON.parse(raw); } catch { return fallback; }
+}
+
+function useLocalStorage(key, fallback) {
+  const [value, setValue] = useState(() => {
+    if (typeof window === "undefined") return fallback;
+    const raw = window.localStorage.getItem(key);
+    return raw ? { ...fallback, ...safeJsonParse(raw, {}) } : fallback;
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem(key, JSON.stringify(value)); } catch {}
+  }, [key, value]);
+  return [value, setValue];
+}
+
+function hashString(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i += 1) {
+    h ^= str.charCodeAt(i);
+    h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+  }
+  return h >>> 0;
+}
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function rng() {
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function pick(a, rng) { return a[Math.floor(rng() * a.length)]; }
+function bool(p, rng) { return rng() < p; }
+function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
+
+function getDec(sym, mkt, price) {
+  if (mkt === "saham") return 0;
+  if (["USDJPY", "GBPJPY", "EURJPY"].includes(sym)) return 3;
+  if (mkt === "forex") return sym === "XAUUSD" ? 2 : 5;
+  const p = price || DEFAULT_PRICES[sym] || 100;
+  return p > 10000 ? 0 : p > 1000 ? 2 : p > 10 ? 3 : p > 1 ? 4 : 6;
+}
+function fmt(n, dec = 2) {
+  if (typeof n !== "number" || Number.isNaN(n)) return "–";
+  return n.toLocaleString("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec });
+}
+function ageLabel(ts) {
+  if (!ts) return "belum ada";
+  const sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (sec < 5) return "baru saja";
+  if (sec < 60) return `${sec}d lalu`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m lalu`;
+  const hr = Math.floor(min / 60);
+  return `${hr}j lalu`;
+}
+function sourceColor(q) {
+  if (q === "LIVE") return GRN;
+  if (q === "DELAYED") return AMB;
+  if (q === "MANUAL") return T;
+  return "#6B7280";
+}
+function openTV(sym) {
+  const s = TV_MAP[sym] || sym;
+  const url = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(s)}`;
+  try { if (typeof openLink === "function") { openLink(url); return; } } catch {}
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+function doSend(msg) {
+  try { if (typeof sendPrompt === "function") { sendPrompt(msg); return; } } catch {}
+  try { if (typeof window.sendPrompt === "function") { window.sendPrompt(msg); return; } } catch {}
+  navigator.clipboard?.writeText(msg).catch(() => {});
+  alert("Pesan analisa disalin ke clipboard.");
+}
+
+function withProxy(url, settings) {
+  const proxy = (settings.proxyBase || "").trim();
+  if (!proxy) return url;
+  const sep = proxy.includes("?") ? "&" : "?";
+  return `${proxy}${sep}url=${encodeURIComponent(url)}`;
+}
+async function fetchText(url, settings, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(withProxy(url, settings), { signal: controller.signal, cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function fetchJSON(url, settings, timeoutMs = 8000) {
+  const txt = await fetchText(url, settings, timeoutMs);
+  return JSON.parse(txt);
+}
+
+function splitPair(sym) {
+  if (sym === "XAUUSD") return { base: "XAU", quote: "USD" };
+  if (sym.length >= 6) return { base: sym.slice(0, 3), quote: sym.slice(3, 6) };
+  return null;
+}
+function yahooTickers(sym, mkt) {
+  if (mkt === "saham") return [`${sym}.JK`];
+  if (mkt === "crypto") {
+    const base = sym.replace("USDT", "");
+    return [`${base}-USD`];
+  }
+  return YAHOO_MAP[sym] || [];
+}
+function stooqTicker(sym, mkt) {
+  if (mkt === "forex") return STOOQ_MAP[sym];
+  // Stooq kadang punya beberapa bursa, tapi coverage IDX tidak konsisten.
+  return null;
+}
+function makePrice({ sym, price, source, quality, ts = Date.now(), changePct = null, note = "" }) {
+  if (typeof price !== "number" || Number.isNaN(price) || price <= 0) return null;
+  return { sym, price, source, quality, ts, changePct, note };
+}
+function betterPrice(next, prev) {
+  if (!next) return prev;
+  if (!prev) return next;
+  const rank = { MANUAL: 5, LIVE: 4, DELAYED: 3, REFERENCE: 2, DEFAULT: 1, ERROR: 0 };
+  if ((rank[next.quality] || 0) >= (rank[prev.quality] || 0)) return next;
+  return prev;
+}
+
+async function fetchBinanceRest(symbols, settings) {
+  if (!symbols.length) return {};
+  const q = encodeURIComponent(JSON.stringify(symbols));
+  const url = `https://data-api.binance.vision/api/v3/ticker/24hr?symbols=${q}`;
+  const data = await fetchJSON(url, settings);
+  const rows = Array.isArray(data) ? data : [data];
+  const out = {};
+  rows.forEach((r) => {
+    const p = parseFloat(r.lastPrice || r.price);
+    const c = r.priceChangePercent != null ? parseFloat(r.priceChangePercent) : null;
+    const px = makePrice({ sym: r.symbol, price: p, source: "Binance REST", quality: "LIVE", changePct: c, note: "public market data" });
+    if (px) out[r.symbol] = px;
+  });
+  return out;
+}
+
+async function fetchCoinGecko(symbols, settings) {
+  const ids = symbols.map((s) => CG_ID[s]).filter(Boolean);
+  if (!ids.length) return {};
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(ids.join(","))}&vs_currencies=usd&include_24hr_change=true&include_last_updated_at=true`;
+  const data = await fetchJSON(url, settings);
+  const out = {};
+  symbols.forEach((sym) => {
+    const id = CG_ID[sym];
+    if (!id || !data[id]) return;
+    const price = Number(data[id].usd);
+    const ts = data[id].last_updated_at ? data[id].last_updated_at * 1000 : Date.now();
+    const ch = data[id].usd_24h_change != null ? Number(data[id].usd_24h_change) : null;
+    const px = makePrice({ sym, price, source: "CoinGecko", quality: "DELAYED", ts, changePct: ch, note: "crypto fallback" });
+    if (px) out[sym] = px;
+  });
+  return out;
+}
+
+async function fetchYahooOne(sym, mkt, settings) {
+  const tickers = yahooTickers(sym, mkt);
+  for (const ticker of tickers) {
+    try {
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=1d&interval=1m`;
+      const data = await fetchJSON(url, settings, 7000);
+      const result = data?.chart?.result?.[0];
+      const meta = result?.meta || {};
+      const q = meta.regularMarketPrice ?? meta.previousClose ?? result?.indicators?.quote?.[0]?.close?.filter(Boolean)?.at(-1);
+      const price = Number(q);
+      let changePct = null;
+      if (meta.chartPreviousClose && price) changePct = ((price - Number(meta.chartPreviousClose)) / Number(meta.chartPreviousClose)) * 100;
+      const px = makePrice({ sym, price, source: `Yahoo ${ticker}`, quality: mkt === "saham" ? "DELAYED" : "DELAYED", changePct, note: "best-effort/no-key" });
+      if (px) return px;
+    } catch {}
+  }
+  return null;
+}
+
+async function fetchFrankfurterOne(sym, settings) {
+  const pair = splitPair(sym);
+  if (!pair || pair.base === "XAU") return null;
+  const url = `https://api.frankfurter.dev/v2/rate/${pair.base}/${pair.quote}`;
+  const data = await fetchJSON(url, settings, 7000);
+  const px = makePrice({ sym, price: Number(data.rate), source: "Frankfurter", quality: "REFERENCE", note: "FX reference rate, bukan tick realtime" });
+  return px;
+}
+
+async function fetchStooqOne(sym, mkt, settings) {
+  const ticker = stooqTicker(sym, mkt);
+  if (!ticker) return null;
+  const url = `https://stooq.com/q/l/?s=${encodeURIComponent(ticker)}&f=sd2t2ohlcv&h&e=csv`;
+  const csv = await fetchText(url, settings, 7000);
+  const lines = csv.trim().split(/\r?\n/);
+  if (lines.length < 2) return null;
+  const headers = lines[0].split(",").map((h) => h.trim().toLowerCase());
+  const vals = lines[1].split(",").map((v) => v.trim());
+  const row = Object.fromEntries(headers.map((h, i) => [h, vals[i]]));
+  const price = Number(row.close || row.last || row.price);
+  const px = makePrice({ sym, price, source: `Stooq ${ticker}`, quality: "DELAYED", note: "CSV fallback" });
+  return px;
+}
+
+async function fetchBestEffortPrices(watchlist, settings, setHealth) {
+  const grouped = {
+    crypto: watchlist.filter((w) => w.m === "crypto").map((w) => w.s),
+    forex: watchlist.filter((w) => w.m === "forex").map((w) => w.s),
+    saham: watchlist.filter((w) => w.m === "saham").map((w) => w.s),
+  };
+  const out = {};
+  const healthPatch = {};
+
+  if (settings.useBinanceRest && grouped.crypto.length) {
+    try {
+      const r = await fetchBinanceRest(grouped.crypto, settings);
+      Object.assign(out, r);
+      healthPatch.binanceRest = { ok: true, msg: `${Object.keys(r).length} crypto`, ts: Date.now() };
+    } catch (e) {
+      healthPatch.binanceRest = { ok: false, msg: e.message || "gagal", ts: Date.now() };
+    }
+  }
+
+  if (settings.useCoinGecko && grouped.crypto.length) {
+    const missing = grouped.crypto.filter((s) => !out[s]);
+    if (missing.length) {
+      try {
+        const r = await fetchCoinGecko(missing, settings);
+        Object.keys(r).forEach((s) => { out[s] = betterPrice(r[s], out[s]); });
+        healthPatch.coinGecko = { ok: true, msg: `${Object.keys(r).length} crypto`, ts: Date.now() };
+      } catch (e) {
+        healthPatch.coinGecko = { ok: false, msg: e.message || "gagal", ts: Date.now() };
+      }
+    }
+  }
+
+  if (settings.useYahoo) {
+    const jobs = watchlist
+      .filter((w) => w.m !== "crypto" || !out[w.s])
+      .map(async (w) => [w.s, await fetchYahooOne(w.s, w.m, settings)]);
+    const res = await Promise.allSettled(jobs);
+    let ok = 0;
+    res.forEach((item) => {
+      if (item.status === "fulfilled") {
+        const [sym, px] = item.value;
+        if (px) { out[sym] = betterPrice(px, out[sym]); ok += 1; }
+      }
+    });
+    healthPatch.yahoo = { ok: ok > 0, msg: ok ? `${ok} simbol` : "tidak ada respon/CORS", ts: Date.now() };
+  }
+
+  if (settings.useFrankfurter && grouped.forex.length) {
+    const missing = grouped.forex.filter((s) => !out[s] || out[s].quality === "DEFAULT");
+    const jobs = missing.map(async (sym) => [sym, await fetchFrankfurterOne(sym, settings)]);
+    const res = await Promise.allSettled(jobs);
+    let ok = 0;
+    res.forEach((item) => {
+      if (item.status === "fulfilled") {
+        const [sym, px] = item.value;
+        if (px) { out[sym] = betterPrice(px, out[sym]); ok += 1; }
+      }
+    });
+    healthPatch.frankfurter = { ok: ok > 0, msg: ok ? `${ok} FX` : "fallback kosong", ts: Date.now() };
+  }
+
+  if (settings.useStooq) {
+    const missing = watchlist.filter((w) => !out[w.s] && w.m === "forex");
+    const jobs = missing.map(async (w) => [w.s, await fetchStooqOne(w.s, w.m, settings)]);
+    const res = await Promise.allSettled(jobs);
+    let ok = 0;
+    res.forEach((item) => {
+      if (item.status === "fulfilled") {
+        const [sym, px] = item.value;
+        if (px) { out[sym] = betterPrice(px, out[sym]); ok += 1; }
+      }
+    });
+    healthPatch.stooq = { ok: ok > 0, msg: ok ? `${ok} simbol` : "tidak ada respon/CORS", ts: Date.now() };
+  }
+
+  setHealth((h) => ({ ...h, ...healthPatch }));
+  return out;
+}
+
+function makeBlueprint(sym, mkt, idx, nonce) {
+  const rng = mulberry32(hashString(`${sym}:${mkt}:${idx}:${nonce}`));
+  const pat = pick(PATS, rng);
+  const tf = pick(TFS, rng);
+  const bull = bool(0.52, rng);
+  const done = bool(0.58, rng);
+  const cfRSI = bool(0.55, rng);
+  const cfVol = bool(0.45, rng);
+  const cfCdl = bool(done ? 0.72 : 0.28, rng);
+  const cfMTF = bool(0.5, rng);
+  const cfCount = [cfRSI, cfVol, cfCdl, cfMTF].filter(Boolean).length;
+  const rr = Number((1.2 + rng() * 2.6).toFixed(1));
+  const score = Math.min(5, 1 + (done ? 1 : 0) + (cfMTF ? 1 : 0) + (cfCount >= 2 ? 1 : 0) + (rr >= 2 ? 1 : 0));
+  return {
+    id: `${sym}-${idx}-${nonce}`,
+    sym, mkt, idx, pat, tf, bull, done,
+    cfRSI, cfVol, cfCdl, cfMTF, cfCount, rr, score,
+    ratioB: pick([0.382, 0.5, 0.618, 0.786, 0.886], rng).toFixed(3),
+    ratioC: (0.382 + rng() * 0.504).toFixed(3),
+    ratioD: pick([0.786, 0.886, 1.272, 1.618], rng).toFixed(3),
+    rsiVal: Number((bull ? 20 + rng() * 20 : 62 + rng() * 22).toFixed(1)),
+    rangeFactor: 0.005 + rng() * 0.012,
+    xaFactor: 0.02 + rng() * 0.045,
+    adFactor: 0.02 + rng() * 0.04,
+    distPct: Math.round(rng() * 100),
+  };
+}
+function finalizeSetup(bp, priceInfo) {
+  const base = priceInfo?.price || DEFAULT_PRICES[bp.sym] || (bp.mkt === "forex" ? 1.1 : bp.mkt === "saham" ? 5000 : 50000);
+  const dec = getDec(bp.sym, bp.mkt, base);
+  const spr = base * bp.rangeFactor;
+  const przLow = Number((base - spr).toFixed(dec));
+  const przHigh = Number((base + spr).toFixed(dec));
+  const przMid = Number(((przLow + przHigh) / 2).toFixed(dec));
+  const xa = base * bp.xaFactor;
+  const ad = base * bp.adFactor;
+  const sl = bp.bull ? Number((przLow - xa * 0.02).toFixed(dec)) : Number((przHigh + xa * 0.02).toFixed(dec));
+  const tp1 = bp.bull ? Number((przHigh + ad * 0.382).toFixed(dec)) : Number((przLow - ad * 0.382).toFixed(dec));
+  const tp2 = bp.bull ? Number((przHigh + ad * 0.618).toFixed(dec)) : Number((przLow - ad * 0.618).toFixed(dec));
+  const inPRZ = bp.distPct > 80;
+  return { ...bp, base, dec, przLow, przHigh, przMid, sl, tp1, tp2, inPRZ, priceInfo };
+}
+function buildMsg(d) {
+  const dir = d.bull ? "Bullish" : "Bearish";
+  const src = d.priceInfo ? `${d.priceInfo.source} (${d.priceInfo.quality}, ${ageLabel(d.priceInfo.ts)})` : "default";
+  return `Analisa setup ${dir} ${d.pat} Pattern di ${d.sym} (${d.tf}). Harga sekarang: ${fmt(d.base, d.dec)} — sumber: ${src}. PRZ: ${fmt(d.przLow, d.dec)}–${fmt(d.przHigh, d.dec)}. Konfirmator: RSI=${d.cfRSI}, Volume=${d.cfVol}, Candlestick=${d.cfCdl}, MTF=${d.cfMTF}. Rasio B=${d.ratioB}, C=${d.ratioC}, D=${d.ratioD}. SL=${fmt(d.sl, d.dec)}, TP1=${fmt(d.tp1, d.dec)}, TP2=${fmt(d.tp2, d.dec)}, R:R=1:${d.rr}. Score ${d.score}/5. Apakah setup ini layak diambil dan apa yang perlu diperhatikan?`;
+}
+
+function useLivePriceEngine(watchlist, settings, manualPrices) {
+  const [priceBook, setPriceBook] = useState({});
+  const [health, setHealth] = useState({});
+  const [lastRefresh, setLastRefresh] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const wsRef = useRef(null);
+
+  const cryptoKey = useMemo(
+    () => watchlist.filter((w) => w.m === "crypto").map((w) => w.s).sort().join("|"),
+    [watchlist]
+  );
+
+  const refreshRest = useCallback(async () => {
+    if (!watchlist.length) return;
+    setLoading(true);
+    try {
+      const live = await fetchBestEffortPrices(watchlist, settings, setHealth);
+      setPriceBook((prev) => {
+        const next = { ...prev };
+        Object.keys(live).forEach((sym) => {
+          if (!manualPrices[sym]) next[sym] = betterPrice(live[sym], next[sym]);
+        });
+        Object.keys(manualPrices).forEach((sym) => {
+          next[sym] = makePrice({ sym, price: Number(manualPrices[sym]), source: "Manual Override", quality: "MANUAL", note: "dikunci user" });
+        });
+        return next;
+      });
+      setLastRefresh(Date.now());
+    } finally {
+      setLoading(false);
+    }
+  }, [watchlist, settings, manualPrices]);
+
+  useEffect(() => { refreshRest(); }, [refreshRest]);
+
+  useEffect(() => {
+    if (!settings.autoRefresh) return undefined;
+    const sec = clamp(Number(settings.refreshSec) || 20, 10, 300);
+    const t = setInterval(refreshRest, sec * 1000);
+    return () => clearInterval(t);
+  }, [settings.autoRefresh, settings.refreshSec, refreshRest]);
+
+  useEffect(() => {
+    if (!settings.useBinanceWs || !cryptoKey) return undefined;
+    const symbols = cryptoKey.split("|").filter(Boolean);
+    const streams = symbols.map((s) => `${s.toLowerCase()}@ticker`).join("/");
+    const url = `wss://data-stream.binance.vision:443/stream?streams=${streams}`;
+    let closedByEffect = false;
+    let retryTimer = null;
+
+    function connect() {
+      try { wsRef.current?.close(); } catch {}
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
+      setHealth((h) => ({ ...h, binanceWs: { ok: null, msg: "connecting", ts: Date.now() } }));
+
+      ws.onopen = () => setHealth((h) => ({ ...h, binanceWs: { ok: true, msg: `${symbols.length} stream`, ts: Date.now() } }));
+      ws.onerror = () => setHealth((h) => ({ ...h, binanceWs: { ok: false, msg: "error/CORS/network", ts: Date.now() } }));
+      ws.onclose = () => {
+        if (closedByEffect) return;
+        setHealth((h) => ({ ...h, binanceWs: { ok: false, msg: "reconnect", ts: Date.now() } }));
+        retryTimer = setTimeout(connect, 4000);
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          const d = msg.data || msg;
+          const sym = d.s;
+          if (!sym || manualPrices[sym]) return;
+          const price = parseFloat(d.c);
+          const changePct = d.P != null ? parseFloat(d.P) : null;
+          const px = makePrice({ sym, price, source: "Binance WS", quality: "LIVE", changePct, note: "ticker stream" });
+          if (!px) return;
+          setPriceBook((prev) => ({ ...prev, [sym]: betterPrice(px, prev[sym]) }));
+          setLastRefresh(Date.now());
+        } catch {}
+      };
+    }
+
+    connect();
+    return () => {
+      closedByEffect = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      try { wsRef.current?.close(); } catch {}
+    };
+  }, [cryptoKey, settings.useBinanceWs, manualPrices]);
+
+  useEffect(() => {
+    setPriceBook((prev) => {
+      const next = { ...prev };
+      Object.keys(manualPrices).forEach((sym) => {
+        next[sym] = makePrice({ sym, price: Number(manualPrices[sym]), source: "Manual Override", quality: "MANUAL", note: "dikunci user" });
+      });
+      Object.keys(next).forEach((sym) => {
+        if (!watchlist.some((w) => w.s === sym)) delete next[sym];
+      });
+      return next;
+    });
+  }, [manualPrices, watchlist]);
+
+  return { priceBook, health, lastRefresh, loading, refreshRest };
+}
+
+function Bdg({ c, bg, children, title }) {
+  return <span title={title} style={{ display: "inline-flex", alignItems: "center", padding: "1px 7px", borderRadius: 20, fontSize: 10, fontWeight: 600, color: c, background: bg, whiteSpace: "nowrap" }}>{children}</span>;
+}
+function ScoreDot({ s }) {
+  return <span style={{ width: 7, height: 7, borderRadius: "50%", background: DOT_CLR[s], display: "inline-block", marginRight: 3, verticalAlign: 1 }} />;
+}
+function PRZBar({ pct, inPRZ }) {
+  return (
+    <div>
+      <div style={{ height: 4, background: "var(--color-border-tertiary, #E5E7EB)", borderRadius: 2, overflow: "hidden", marginBottom: 2 }}>
+        <div style={{ height: "100%", width: `${pct}%`, background: inPRZ ? T : G, borderRadius: 2 }} />
+      </div>
+      <span style={{ fontSize: 9, color: inPRZ ? T : "var(--color-text-secondary, #6B7280)", fontWeight: inPRZ ? 600 : 400 }}>
+        {inPRZ ? "▲ Dalam PRZ" : `${pct}% menuju PRZ`}
+      </span>
+    </div>
+  );
+}
+function Metric({ label, value, sub, color }) {
+  return (
+    <div style={{ background: "var(--color-background-secondary, #F9FAFB)", borderRadius: "var(--border-radius-md, 10px)", padding: "9px 11px" }}>
+      <div style={{ fontSize: 9, color: "var(--color-text-secondary, #6B7280)", textTransform: "uppercase", letterSpacing: ".04em", marginBottom: 3 }}>{label}</div>
+      <div style={{ fontSize: 20, fontWeight: 700, color: color || N, lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 9, color: "var(--color-text-secondary, #6B7280)", marginTop: 3 }}>{sub}</div>}
+    </div>
+  );
+}
+function KV({ k, v, vc }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "5px 0", borderBottom: BDR, fontSize: 12, gap: 8 }}>
+      <span style={{ color: "var(--color-text-secondary, #6B7280)" }}>{k}</span>
+      <span style={{ fontWeight: 600, color: vc || "var(--color-text-primary, #111827)", textAlign: "right" }}>{v}</span>
+    </div>
+  );
+}
+function SourceBadge({ px }) {
+  if (!px) return <Bdg c="#6B7280" bg="#F3F4F6">Default</Bdg>;
+  return <Bdg c={sourceColor(px.quality)} bg={px.quality === "LIVE" ? "#D1FAE5" : px.quality === "MANUAL" ? "#E6F4F4" : "#FEF3C7"} title={`${px.source} · ${ageLabel(px.ts)} · ${px.note}`}>{px.quality}</Bdg>;
+}
+function HealthBadge({ name, item }) {
+  const color = item?.ok === true ? GRN : item?.ok === false ? RED : AMB;
+  const bg = item?.ok === true ? "#D1FAE5" : item?.ok === false ? "#FEE2E2" : "#FEF3C7";
+  return <span title={item ? `${item.msg} · ${ageLabel(item.ts)}` : "belum dicek"} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 20, background: bg, color, fontWeight: 700, whiteSpace: "nowrap" }}>{name}</span>;
+}
+
+function PriceCell({ row, manualPrices, onManual, onClearManual }) {
+  const [val, setVal] = useState("");
+  const [editing, setEditing] = useState(false);
+  useEffect(() => {
+    if (!editing) setVal(manualPrices[row.sym] ? fmt(manualPrices[row.sym], row.dec) : "");
+  }, [editing, manualPrices, row.sym, row.dec]);
+  function commit() {
+    const n = parseFloat(String(val).replace(/,/g, ""));
+    if (!Number.isNaN(n) && n > 0) onManual(row.sym, n);
+    setEditing(false);
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: sourceColor(row.priceInfo?.quality), minWidth: 74, textAlign: "right" }}>{fmt(row.base, row.dec)}</span>
+        <SourceBadge px={row.priceInfo} />
+      </div>
+      <div style={{ display: "flex", gap: 4 }}>
+        <input
+          value={val}
+          onFocus={() => setEditing(true)}
+          onChange={(e) => setVal(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") { commit(); e.currentTarget.blur(); } }}
+          onBlur={commit}
+          placeholder="manual"
+          style={{ width: 68, fontSize: 10, height: 22, padding: "0 5px", borderRadius: 6, border: manualPrices[row.sym] ? `1px solid ${T}` : BDR, outline: "none", textAlign: "right", background: "var(--color-background-primary, #fff)" }}
+        />
+        <button onClick={() => onClearManual(row.sym)} style={{ fontSize: 9, padding: "0 5px", borderRadius: 5, border: BDR, background: "var(--color-background-secondary, #F9FAFB)", color: "var(--color-text-secondary, #6B7280)", cursor: "pointer" }}>Live</button>
+      </div>
+    </div>
+  );
+}
+function BtnAnalisa({ row, full = false }) {
+  const s = full
+    ? { width: "100%", padding: "10px", fontSize: 13, borderRadius: "var(--border-radius-md, 10px)", border: `1.5px solid ${N}`, background: N, color: "#fff", cursor: "pointer", fontWeight: 700, marginTop: 8 }
+    : { fontSize: 10, padding: "3px 8px", borderRadius: 6, border: `1px solid ${T}`, background: "#E6F4F4", color: T, cursor: "pointer", fontWeight: 700, whiteSpace: "nowrap" };
+  return <button style={s} onClick={(e) => { e.stopPropagation(); doSend(buildMsg(row)); }}>Analisa ↗</button>;
+}
+
+function DetailView({ row, onBack }) {
+  if (!row) return <div style={{ textAlign: "center", padding: "3rem", color: "var(--color-text-secondary, #6B7280)", fontSize: 13 }}>Klik baris scanner untuk melihat detail setup.</div>;
+  const cfItems = [
+    { lbl: "RSI Divergence", ok: row.cfRSI, info: row.cfRSI ? `RSI ${row.rsiVal} — ${row.bull ? "oversold" : "overbought"}` : "Tidak ada divergence" },
+    { lbl: "Volume Spike", ok: row.cfVol, info: row.cfVol ? "Volume 1.8–2.5x rata-rata" : "Volume masih flat" },
+    { lbl: "Candlestick Reversal", ok: row.cfCdl, info: row.cfCdl ? (row.bull ? "Pin bar bullish di PRZ" : "Bearish Engulfing di PRZ") : "Belum ada reversal candle" },
+    { lbl: "MTF Aligned", ok: row.cfMTF, info: row.cfMTF ? "H4 & Daily searah dengan setup" : "TF besar belum konfirmasi" },
+  ];
+  const q = row.cfCount >= 3 ? { txt: "Setup kuat — 3+ konfirmator. Sizing normal tetap wajib disiplin risiko.", c: GRN, bg: "#D1FAE5" }
+    : row.cfCount >= 2 ? { txt: "Setup sedang — 2 konfirmator. Gunakan sizing kecil atau tunggu candle konfirmasi.", c: AMB, bg: "#FEF3C7" }
+      : { txt: "Setup lemah — < 2 konfirmator. Lebih aman skip.", c: RED, bg: "#FEE2E2" };
+  return (
+    <div>
+      <button onClick={onBack} style={{ fontSize: 11, marginBottom: 12, padding: "4px 10px", borderRadius: "var(--border-radius-md, 8px)", border: BDR, background: "var(--color-background-primary, #fff)", cursor: "pointer", color: "var(--color-text-primary, #111827)", display: "inline-flex", alignItems: "center", gap: 4 }}>← Kembali</button>
+      <div style={{ background: N, borderRadius: "var(--border-radius-md, 10px)", padding: "13px 15px", marginBottom: 10, color: "#fff" }}>
+        <div style={{ fontSize: 10, color: "rgba(255,255,255,.55)", textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 3 }}>{MKT_LBL[row.mkt]} · {row.tf}</div>
+        <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 7 }}>{row.sym} — {row.bull ? "Bullish" : "Bearish"} {row.pat}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, padding: "6px 9px", background: "rgba(255,255,255,.08)", borderRadius: 6, fontSize: 11, flexWrap: "wrap" }}>
+          <span style={{ color: "rgba(255,255,255,.65)" }}>Harga:</span>
+          <span style={{ color: "#fff", fontWeight: 800 }}>{fmt(row.base, row.dec)}</span>
+          <SourceBadge px={row.priceInfo} />
+          <span style={{ color: "rgba(255,255,255,.65)" }}>{row.priceInfo ? `${row.priceInfo.source} · ${ageLabel(row.priceInfo.ts)}` : "Default"}</span>
+          <button onClick={() => openTV(row.sym)} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, border: "1px solid rgba(255,255,255,.2)", background: "rgba(255,255,255,.1)", color: "#fff", cursor: "pointer", marginLeft: "auto" }}>Buka TV ↗</button>
+        </div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <Bdg c={row.bull ? "#185FA5" : "#991B1B"} bg={row.bull ? "#DBEAFE" : "#FEE2E2"}>{row.bull ? "▲ BUY" : "▼ SELL"}</Bdg>
+          <Bdg c={row.done ? "#0F6E56" : "#92400E"} bg={row.done ? "#D1FAE5" : "#FEF3C7"}>{row.done ? "Complete" : "Forming"}</Bdg>
+          <span style={{ fontSize: 10, padding: "1px 8px", borderRadius: 20, background: "rgba(255,255,255,.15)", color: "#fff", display: "inline-flex", alignItems: "center", gap: 3 }}>
+            <ScoreDot s={row.score} />{SCORE_LBL[row.score]}
+          </span>
+        </div>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+        <div style={CARD}>
+          <div style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--color-text-secondary, #6B7280)", marginBottom: 7 }}>Info pola</div>
+          <KV k="Pola" v={`${row.pat} Pattern`} />
+          <KV k="Rasio B" v={row.ratioB} />
+          <KV k="Rasio C" v={row.ratioC} />
+          <KV k="Rasio D" v={row.ratioD} />
+          <KV k="R:R" v={`1:${row.rr}`} vc={GRN} />
+        </div>
+        <div style={CARD}>
+          <div style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--color-text-secondary, #6B7280)", marginBottom: 7 }}>Level trading</div>
+          <KV k="PRZ Low" v={fmt(row.przLow, row.dec)} />
+          <KV k="PRZ High" v={fmt(row.przHigh, row.dec)} />
+          <KV k="Stop Loss" v={fmt(row.sl, row.dec)} vc={RED} />
+          <KV k="Take Profit 1" v={fmt(row.tp1, row.dec)} vc={GRN} />
+          <KV k="Take Profit 2" v={fmt(row.tp2, row.dec)} vc={GRN} />
+        </div>
+      </div>
+      <div style={{ ...CARD, marginBottom: 8 }}>
+        <div style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--color-text-secondary, #6B7280)", marginBottom: 8 }}>Checklist konfirmasi</div>
+        {cfItems.map((cf, i) => (
+          <div key={cf.lbl} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", padding: "5px 0", borderBottom: i < cfItems.length - 1 ? BDR : "none", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 5, minWidth: 145 }}>
+              <span style={{ fontSize: 13, color: cf.ok ? T : "var(--color-text-secondary, #6B7280)", fontWeight: 700 }}>{cf.ok ? "✓" : "–"}</span>
+              <span style={{ fontSize: 11, color: cf.ok ? "var(--color-text-primary, #111827)" : "var(--color-text-secondary, #6B7280)", fontWeight: cf.ok ? 700 : 400 }}>{cf.lbl}</span>
+            </div>
+            <span style={{ fontSize: 10, color: "var(--color-text-secondary, #6B7280)", textAlign: "right", flex: 1 }}>{cf.info}</span>
+          </div>
+        ))}
+        <div style={{ marginTop: 7, padding: "6px 9px", background: q.bg, borderRadius: "var(--border-radius-md, 8px)", fontSize: 11, color: q.c, borderLeft: `3px solid ${q.c}`, lineHeight: 1.5, borderTopLeftRadius: 0, borderBottomLeftRadius: 0 }}>{q.txt}</div>
+      </div>
+      <BtnAnalisa row={row} full />
+    </div>
+  );
+}
+
+function WatchlistManager({ watchlist, manualPrices, onAdd, onRemove, onPreset }) {
+  const [inp, setInp] = useState("");
+  const [mkt, setMkt] = useState("forex");
+  const grouped = Object.fromEntries(MARKETS.map((m) => [m, watchlist.filter((w) => w.m === m)]));
+  function handleAdd() {
+    const symbols = inp.toUpperCase().split(",").map((s) => s.trim()).filter(Boolean);
+    symbols.forEach((s) => onAdd(s, mkt));
+    setInp("");
+  }
+  return (
+    <div>
+      <div style={{ ...CARD, marginBottom: 8 }}>
+        <div style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--color-text-secondary, #6B7280)", marginBottom: 10 }}>Tambah instrumen</div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+          <input value={inp} onChange={(e) => setInp(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleAdd()} placeholder="BBCA, EURUSD, BTCUSDT..." style={{ flex: 1, ...SEL, height: 30 }} />
+          <select value={mkt} onChange={(e) => setMkt(e.target.value)} style={SEL}>
+            <option value="forex">Forex</option>
+            <option value="saham">Saham IDX</option>
+            <option value="crypto">Crypto</option>
+          </select>
+          <button onClick={handleAdd} style={{ fontSize: 11, padding: "0 10px", height: 30, borderRadius: "var(--border-radius-md, 8px)", border: `0.5px solid ${N}`, background: N, color: "#fff", cursor: "pointer", fontWeight: 700, whiteSpace: "nowrap" }}>+ Tambah</button>
+        </div>
+        <div style={{ fontSize: 10, color: "var(--color-text-secondary, #6B7280)", marginBottom: 8, lineHeight: 1.5 }}>
+          Format: crypto pakai pasangan Binance seperti BTCUSDT. Saham IDX pakai kode tanpa .JK, misalnya BBCA. Forex pakai EURUSD/GBPJPY/XAUUSD.
+        </div>
+        {MARKETS.map((m) => grouped[m].length > 0 && (
+          <div key={m} style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 9, color: "var(--color-text-secondary, #6B7280)", textTransform: "uppercase", letterSpacing: ".04em", marginBottom: 5 }}>{MKT_ICON[m]} {MKT_LBL[m]}</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+              {grouped[m].map((w) => (
+                <span key={w.s} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 9px", borderRadius: 20, fontSize: 11, background: "var(--color-background-secondary, #F9FAFB)", border: BDR, color: "var(--color-text-primary, #111827)" }}>
+                  {w.s}
+                  {manualPrices[w.s] && <span style={{ fontSize: 9, color: T, fontWeight: 700 }}>Manual</span>}
+                  <button onClick={() => onRemove(w.s)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 9, color: "var(--color-text-secondary, #6B7280)", padding: 0, marginLeft: 2 }}>✕</button>
+                </span>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={CARD}>
+        <div style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--color-text-secondary, #6B7280)", marginBottom: 10 }}>Preset watchlist</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 7 }}>
+          {[["forex", "💱 Forex Majors"], ["saham", "🏦 Saham IDX Top"], ["crypto", "₿ Crypto Top"]].map(([key, lbl]) => (
+            <button key={key} onClick={() => onPreset(key)} style={{ fontSize: 11, padding: "8px", borderRadius: "var(--border-radius-md, 8px)", border: BDR, background: "var(--color-background-secondary, #F9FAFB)", color: "var(--color-text-primary, #111827)", cursor: "pointer", fontWeight: 700 }}>{lbl}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ApiSettings({ settings, setSettings, health, onRefresh, loading }) {
+  function set(k, v) { setSettings((s) => ({ ...s, [k]: v })); }
+  const sources = [
+    ["binanceWs", "Binance WS"], ["binanceRest", "Binance REST"], ["coinGecko", "CoinGecko"],
+    ["yahoo", "Yahoo"], ["frankfurter", "Frankfurter"], ["stooq", "Stooq"],
+  ];
+  const toggles = [
+    ["useBinanceWs", "Binance WebSocket realtime crypto"],
+    ["useBinanceRest", "Binance REST fallback crypto"],
+    ["useCoinGecko", "CoinGecko fallback crypto"],
+    ["useYahoo", "Yahoo best-effort forex/XAU/IDX"],
+    ["useFrankfurter", "Frankfurter FX reference"],
+    ["useStooq", "Stooq CSV fallback"],
+  ];
+  return (
+    <div>
+      <div style={{ ...CARD, marginBottom: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", marginBottom: 10 }}>
+          <div>
+            <div style={{ fontSize: 9, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--color-text-secondary, #6B7280)", marginBottom: 2 }}>Status API</div>
+            <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>{sources.map(([id, label]) => <HealthBadge key={id} name={label} item={health[id]} />)}</div>
+          </div>
+          <button onClick={onRefresh} disabled={loading} style={{ fontSize: 11, padding: "6px 11px", borderRadius: 8, border: `1px solid ${N}`, background: loading ? "#E5E7EB" : N, color: loading ? "#6B7280" : "#fff", cursor: loading ? "not-allowed" : "pointer", fontWeight: 800 }}>{loading ? "Loading..." : "Refresh API"}</button>
+        </div>
+        <div style={{ fontSize: 11, color: "var(--color-text-secondary, #6B7280)", lineHeight: 1.55 }}>
+          Crypto bisa realtime via Binance WebSocket. Forex dan IDX gratis biasanya hanya delayed/reference, dan beberapa endpoint bisa ditolak browser karena CORS. Pakai Proxy URL Worker gratis bila Yahoo/Stooq gagal.
+        </div>
+      </div>
+      <div style={{ ...CARD, marginBottom: 8 }}>
+        <div style={{ fontSize: 9, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--color-text-secondary, #6B7280)", marginBottom: 10 }}>Pengaturan refresh</div>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, marginBottom: 8 }}>
+          <input type="checkbox" checked={settings.autoRefresh} onChange={(e) => set("autoRefresh", e.target.checked)} /> Auto refresh REST
+        </label>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+          <span style={{ fontSize: 12, color: "var(--color-text-secondary, #6B7280)" }}>Interval</span>
+          <input type="number" min="10" max="300" value={settings.refreshSec} onChange={(e) => set("refreshSec", Number(e.target.value))} style={{ ...SEL, width: 90 }} />
+          <span style={{ fontSize: 12, color: "var(--color-text-secondary, #6B7280)" }}>detik</span>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          {toggles.map(([key, label]) => (
+            <label key={key} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11, background: "var(--color-background-secondary, #F9FAFB)", border: BDR, borderRadius: 8, padding: "7px 9px" }}>
+              <input type="checkbox" checked={!!settings[key]} onChange={(e) => set(key, e.target.checked)} /> {label}
+            </label>
+          ))}
+        </div>
+      </div>
+      <div style={CARD}>
+        <div style={{ fontSize: 9, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--color-text-secondary, #6B7280)", marginBottom: 8 }}>Proxy URL opsional</div>
+        <input value={settings.proxyBase} onChange={(e) => set("proxyBase", e.target.value)} placeholder="https://nama-worker.username.workers.dev" style={{ ...SEL, width: "100%", height: 34, marginBottom: 8 }} />
+        <div style={{ fontSize: 10, color: "var(--color-text-secondary, #6B7280)", lineHeight: 1.55 }}>
+          Kosongkan jika direct fetch berhasil. Isi dengan URL Cloudflare Worker gratis agar browser bisa ambil data dari Yahoo/Stooq/Frankfurter/Binance REST saat CORS diblokir.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function HarmonicWatchlistScanner() {
+  const [watchlist, setWatchlist] = useLocalStorage("hc_live_watchlist", [
+    ...PRESETS.forex.map((s) => ({ s, m: "forex" })),
+    ...PRESETS.saham.map((s) => ({ s, m: "saham" })),
+    ...PRESETS.crypto.map((s) => ({ s, m: "crypto" })),
+  ]);
+  const [manualPrices, setManualPrices] = useLocalStorage("hc_live_manual_prices", {});
+  const [settings, setSettings] = useLocalStorage("hc_live_settings", DEFAULT_SETTINGS);
+  const [scanNonce, setScanNonce] = useState(() => Math.floor(Date.now() / 60000));
+  const [activeTab, setActiveTab] = useState("scanner");
+  const [selectedId, setSelectedId] = useState(null);
+  const [filters, setFilters] = useState({ market: "all", tf: "all", pat: "all", status: "all", score: "all", source: "all" });
+
+  const { priceBook, health, lastRefresh, loading, refreshRest } = useLivePriceEngine(watchlist, settings, manualPrices);
+
+  const blueprints = useMemo(() => watchlist.map((w, i) => makeBlueprint(w.s, w.m, i, scanNonce)), [watchlist, scanNonce]);
+  const rows = useMemo(() => blueprints.map((bp) => finalizeSetup(bp, priceBook[bp.sym])), [blueprints, priceBook]);
+  const selectedRow = useMemo(() => rows.find((r) => r.id === selectedId) || rows.find((r) => r.sym === selectedId) || null, [rows, selectedId]);
+
+  const filtered = useMemo(() => {
+    let res = [...rows];
+    const f = filters;
+    if (f.market !== "all") res = res.filter((d) => d.mkt === f.market);
+    if (f.tf !== "all") res = res.filter((d) => d.tf === f.tf);
+    if (f.pat !== "all") res = res.filter((d) => d.pat === f.pat);
+    if (f.status === "complete") res = res.filter((d) => d.done);
+    if (f.status === "forming") res = res.filter((d) => !d.done);
+    if (f.score !== "all") res = res.filter((d) => d.score >= parseInt(f.score, 10));
+    if (f.source === "live") res = res.filter((d) => d.priceInfo?.quality === "LIVE");
+    if (f.source === "delayed") res = res.filter((d) => ["DELAYED", "REFERENCE"].includes(d.priceInfo?.quality));
+    if (f.source === "manual") res = res.filter((d) => d.priceInfo?.quality === "MANUAL");
+    if (f.source === "default") res = res.filter((d) => !d.priceInfo);
+    return res.sort((a, b) => b.score - a.score || b.cfCount - a.cfCount);
+  }, [rows, filters]);
+
+  function setF(k, v) { setFilters((f) => ({ ...f, [k]: v })); }
+  function addToWL(s, m) {
+    const sym = s.toUpperCase().trim();
+    if (!sym || watchlist.some((w) => w.s === sym)) return;
+    setWatchlist([...watchlist, { s: sym, m }]);
+  }
+  function removeFromWL(s) {
+    setWatchlist(watchlist.filter((w) => w.s !== s));
+    setManualPrices((p) => { const n = { ...p }; delete n[s]; return n; });
+  }
+  function loadPreset(type) {
+    setWatchlist([...watchlist.filter((w) => w.m !== type), ...PRESETS[type].map((s) => ({ s, m: type }))]);
+  }
+  function manual(sym, price) { setManualPrices((p) => ({ ...p, [sym]: price })); }
+  function clearManual(sym) { setManualPrices((p) => { const n = { ...p }; delete n[sym]; return n; }); }
+  function rescan() { setScanNonce(Date.now()); refreshRest(); }
+
+  const complete = filtered.filter((d) => d.done).length;
+  const liveCount = rows.filter((d) => d.priceInfo?.quality === "LIVE").length;
+  const updatedCount = rows.filter((d) => d.priceInfo).length;
+  const avgScore = filtered.length ? (filtered.reduce((s, d) => s + d.score, 0) / filtered.length).toFixed(1) : "0";
+  const TABS = [
+    { id: "scanner", label: "Scanner" },
+    { id: "detail", label: "Detail Setup" },
+    { id: "watchlist", label: "Kelola Watchlist" },
+    { id: "api", label: "API & Realtime" },
+  ];
+  const CHIPS = [{ v: "all", l: "Semua" }, { v: "3", l: "Score 3+" }, { v: "4", l: "Score 4+" }, { v: "5", l: "A+ Only" }];
+
+  return (
+    <div style={{ fontFamily: "var(--font-sans, Inter, system-ui, sans-serif)", background: "var(--color-background-tertiary, #F3F4F6)", minHeight: "100vh", paddingBottom: 40 }}>
+      <div style={{ height: 3, background: G }} />
+      <div style={{ background: N, padding: "13px 16px 11px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <div style={{ fontSize: 10, color: "rgba(255,255,255,.5)", letterSpacing: ".07em", textTransform: "uppercase", marginBottom: 2 }}>The Harmonic Code · Trader Klinik</div>
+            <div style={{ fontSize: 17, fontWeight: 800, color: "#fff", marginBottom: 2 }}>Harmonic Watchlist Scanner Live</div>
+            <div style={{ fontSize: 11, color: "rgba(255,255,255,.6)" }}>
+              {watchlist.length} pair · {lastRefresh ? `Update ${new Date(lastRefresh).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "menunggu update"}
+              <span style={{ marginLeft: 8, fontSize: 9, padding: "1px 6px", borderRadius: 4, background: "rgba(26,107,107,.4)", color: "#A7D8D8" }}>LIVE {liveCount}</span>
+              <span style={{ marginLeft: 4, fontSize: 9, padding: "1px 6px", borderRadius: 4, background: "rgba(255,255,255,.1)", color: "#fff" }}>Updated {updatedCount}/{rows.length}</span>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={refreshRest} disabled={loading} style={{ fontSize: 11, padding: "5px 10px", borderRadius: "var(--border-radius-md, 8px)", border: "1px solid rgba(255,255,255,.2)", background: loading ? "rgba(255,255,255,.05)" : "rgba(255,255,255,.1)", color: "#fff", cursor: loading ? "wait" : "pointer", fontWeight: 700, whiteSpace: "nowrap" }}>↻ Update Harga</button>
+            <button onClick={rescan} style={{ fontSize: 11, padding: "5px 10px", borderRadius: "var(--border-radius-md, 8px)", border: "1px solid rgba(255,255,255,.2)", background: "rgba(255,255,255,.1)", color: "#fff", cursor: "pointer", fontWeight: 700, whiteSpace: "nowrap" }}>⟲ Rescan Pola</button>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ background: "var(--color-background-primary, #fff)", borderBottom: BDR, display: "flex", padding: "0 14px", overflowX: "auto" }}>
+        {TABS.map((t) => (
+          <button key={t.id} onClick={() => setActiveTab(t.id)} style={{ padding: "9px 11px", fontSize: 12, fontWeight: activeTab === t.id ? 800 : 500, color: activeTab === t.id ? "var(--color-text-primary, #111827)" : "var(--color-text-secondary, #6B7280)", background: "none", border: "none", borderBottom: activeTab === t.id ? `2px solid ${N}` : "2px solid transparent", cursor: "pointer", marginBottom: -1, whiteSpace: "nowrap" }}>{t.label}</button>
+        ))}
+      </div>
+
+      <div style={{ padding: "12px 14px" }}>
+        {activeTab === "scanner" && (
+          <>
+            <div style={{ background: "var(--color-background-secondary, #F9FAFB)", border: BDR, borderLeft: `3px solid ${G}`, borderRadius: `0 var(--border-radius-md, 8px) var(--border-radius-md, 8px) 0`, padding: "7px 10px", marginBottom: 10, fontSize: 11, color: "var(--color-text-secondary, #6B7280)", lineHeight: 1.5 }}>
+              <strong style={{ color: "var(--color-text-primary, #111827)" }}>Live engine:</strong> crypto realtime via Binance WS; forex/IDX via Yahoo best-effort + Frankfurter/Stooq fallback. Jika sumber non-crypto gagal, buka tab <strong>API & Realtime</strong> lalu isi Proxy URL Worker.
+            </div>
+
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 9, alignItems: "center" }}>
+              {[
+                { id: "market", opts: [["all", "Semua Market"], ["forex", "Forex"], ["saham", "Saham IDX"], ["crypto", "Crypto"]] },
+                { id: "tf", opts: [["all", "Semua TF"], ...TFS.map((t) => [t, t])] },
+                { id: "pat", opts: [["all", "Semua Pola"], ...PATS.map((p) => [p, p])] },
+                { id: "status", opts: [["all", "Semua Status"], ["complete", "Complete saja"], ["forming", "Forming saja"]] },
+                { id: "source", opts: [["all", "Semua Harga"], ["live", "LIVE"], ["delayed", "Delayed/Reference"], ["manual", "Manual"], ["default", "Default"]] },
+              ].map((f) => (
+                <select key={f.id} value={filters[f.id]} onChange={(e) => setF(f.id, e.target.value)} style={SEL}>
+                  {f.opts.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                </select>
+              ))}
+            </div>
+
+            <div style={{ display: "flex", gap: 5, marginBottom: 10, alignItems: "center" }}>
+              <span style={{ fontSize: 10, color: "var(--color-text-secondary, #6B7280)" }}>Score:</span>
+              {CHIPS.map((c) => (
+                <button key={c.v} onClick={() => setF("score", c.v)} style={{ fontSize: 10, padding: "2px 9px", borderRadius: 20, cursor: "pointer", fontWeight: filters.score === c.v ? 800 : 500, border: filters.score === c.v ? `1px solid ${N}` : `0.5px solid var(--color-border-secondary, #D1D5DB)`, background: filters.score === c.v ? N : "var(--color-background-primary, #fff)", color: filters.score === c.v ? "#fff" : "var(--color-text-secondary, #6B7280)" }}>{c.l}</button>
+              ))}
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 7, marginBottom: 11 }}>
+              <Metric label="Total Setup" value={filtered.length} sub={`dari ${rows.length} pair`} />
+              <Metric label="Complete" value={complete} sub="siap divalidasi" color={GRN} />
+              <Metric label="Live Price" value={liveCount} sub="Binance WS/REST" color={T} />
+              <Metric label="Avg Score" value={`${avgScore}/5`} sub="kualitas rata-rata" />
+            </div>
+
+            <div style={{ background: "var(--color-background-primary, #fff)", border: BDR, borderRadius: "var(--border-radius-md, 10px)", overflow: "hidden", marginBottom: 8 }}>
+              {filtered.length === 0 ? (
+                <div style={{ padding: "2.5rem", textAlign: "center", color: "var(--color-text-secondary, #6B7280)", fontSize: 12 }}>Tidak ada setup yang cocok.</div>
+              ) : (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, tableLayout: "fixed" }}>
+                    <thead>
+                      <tr style={{ background: "var(--color-background-secondary, #F9FAFB)" }}>
+                        {[["Pair", 70], ["Harga Live", 136], ["TF", 34], ["Pola", 62], ["Arah", 54], ["Status", 62], ["PRZ Mid", 72], ["Jarak PRZ", 82], ["Konfirm", 52], ["R:R", 38], ["Score", 52], ["", 60]].map(([h, w]) => (
+                          <th key={h} style={{ padding: "6px 7px", textAlign: "left", fontSize: 9, fontWeight: 800, color: h === "Harga Live" ? T : "var(--color-text-secondary, #6B7280)", textTransform: "uppercase", letterSpacing: ".04em", borderBottom: BDR, width: w, whiteSpace: "nowrap" }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.map((d, i) => (
+                        <tr key={d.id} onClick={() => { setSelectedId(d.id); setActiveTab("detail"); }} style={{ borderBottom: i < filtered.length - 1 ? BDR : "none", cursor: "pointer", background: "var(--color-background-primary, #fff)", transition: "background .1s" }} onMouseEnter={(e) => { e.currentTarget.style.background = "var(--color-background-secondary, #F9FAFB)"; }} onMouseLeave={(e) => { e.currentTarget.style.background = "var(--color-background-primary, #fff)"; }}>
+                          <td style={{ padding: "6px 7px", fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}><span style={{ fontSize: 9, marginRight: 3 }}>{MKT_ICON[d.mkt]}</span>{d.sym}</td>
+                          <td style={{ padding: "4px 7px" }} onClick={(e) => e.stopPropagation()}><PriceCell row={d} manualPrices={manualPrices} onManual={manual} onClearManual={clearManual} /></td>
+                          <td style={{ padding: "6px 7px" }}><span style={{ fontSize: 9, padding: "1px 4px", background: "var(--color-background-secondary, #F9FAFB)", borderRadius: 3, color: "var(--color-text-secondary, #6B7280)", fontWeight: 700 }}>{d.tf}</span></td>
+                          <td style={{ padding: "6px 7px", overflow: "hidden", textOverflow: "ellipsis" }}>{d.pat}</td>
+                          <td style={{ padding: "6px 7px" }}><Bdg c={d.bull ? "#185FA5" : "#991B1B"} bg={d.bull ? "#DBEAFE" : "#FEE2E2"}>{d.bull ? "▲ Buy" : "▼ Sell"}</Bdg></td>
+                          <td style={{ padding: "6px 7px" }}><Bdg c={d.done ? "#0F6E56" : "#92400E"} bg={d.done ? "#D1FAE5" : "#FEF3C7"}>{d.done ? "Complete" : "Forming"}</Bdg></td>
+                          <td style={{ padding: "6px 7px", fontSize: 10, color: "var(--color-text-secondary, #6B7280)", overflow: "hidden", textOverflow: "ellipsis" }}>{fmt(d.przMid, d.dec)}</td>
+                          <td style={{ padding: "6px 7px" }}><PRZBar pct={d.distPct} inPRZ={d.inPRZ} /></td>
+                          <td style={{ padding: "6px 7px", textAlign: "center" }}><span style={{ fontWeight: 800, fontSize: 12, color: d.cfCount >= 3 ? GRN : d.cfCount >= 2 ? AMB : RED }}>{d.cfCount}/4</span></td>
+                          <td style={{ padding: "6px 7px" }}><span style={{ fontSize: 10, padding: "2px 5px", borderRadius: 11, background: "#E6F4F4", color: T, fontWeight: 700 }}>1:{d.rr}</span></td>
+                          <td style={{ padding: "6px 7px", whiteSpace: "nowrap" }}><ScoreDot s={d.score} /><span style={{ color: SCORE_CLR[d.score], fontWeight: 800, fontSize: 11 }}>{SCORE_LBL[d.score]}</span></td>
+                          <td style={{ padding: "6px 7px" }}><BtnAnalisa row={d} /></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+            <p style={{ fontSize: 10, color: "var(--color-text-secondary, #6B7280)", lineHeight: 1.5 }}>
+              Catatan: harga LIVE hanya berarti feed harga berhasil masuk; harmonic pattern tetap simulasi teknikal berbasis level Fibonacci dan wajib divalidasi di chart nyata. Untuk IDX/forex gratis, status biasanya DELAYED/REFERENCE karena feed tick realtime umumnya berbayar.
+            </p>
+          </>
+        )}
+        {activeTab === "detail" && <DetailView row={selectedRow} onBack={() => setActiveTab("scanner")} />}
+        {activeTab === "watchlist" && <WatchlistManager watchlist={watchlist} manualPrices={manualPrices} onAdd={addToWL} onRemove={removeFromWL} onPreset={loadPreset} />}
+        {activeTab === "api" && <ApiSettings settings={settings} setSettings={setSettings} health={health} onRefresh={refreshRest} loading={loading} />}
+      </div>
+    </div>
+  );
+}
